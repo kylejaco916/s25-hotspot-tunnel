@@ -1,0 +1,55 @@
+#!/data/data/com.termux/files/usr/bin/bash
+PORT=1080
+SESSION="s25_proxy"
+
+case "${1:-start}" in
+  _loop)
+    ulimit -n "$(ulimit -Hn)" 2>/dev/null || ulimit -n 16384 2>/dev/null
+    while true; do
+      microsocks -i 0.0.0.0 -p "$PORT"
+      sleep 1
+    done
+    ;;
+  start)
+    termux-wake-lock 2>/dev/null
+    if ! pgrep -x microsocks >/dev/null; then
+      tmux kill-session -t "$SESSION" 2>/dev/null || true
+      tmux new-session -d -s "$SESSION" "$PREFIX/bin/s25-tunnel _loop"
+      sleep 1
+    fi
+    "$PREFIX/bin/s25-tunnel" status
+    ;;
+  stop)
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    pkill -x microsocks 2>/dev/null || true
+    termux-wake-unlock 2>/dev/null || true
+    echo "[-] Tunnel stopped."
+    ;;
+  restart)
+    "$PREFIX/bin/s25-tunnel" stop
+    sleep 1
+    "$PREFIX/bin/s25-tunnel" start
+    ;;
+  status)
+    echo "========================================================"
+    if pgrep -x microsocks >/dev/null; then
+      PID=$(pgrep -x microsocks | head -n1)
+      FDS=$(awk '/Max open files/{print $4}' /proc/$PID/limits 2>/dev/null)
+      echo " [+] STATE    : RUNNING (PID: $PID | Max FDs: ${FDS:-32768})"
+      echo " [+] BINDING  : 0.0.0.0:$PORT (All USB & Wi-Fi Interfaces)"
+      echo " [+] USB ADB  : 127.0.0.1:$PORT"
+      echo " [+] WIFI LAN : ACTIVE on Hotspot Gateway:$PORT"
+    else
+      echo " [-] STATE    : STOPPED"
+    fi
+    echo "========================================================"
+    ;;
+  test)
+    echo "[*] Testing SOCKS5 egress via rmnet_data0..."
+    IP=$(curl -s4 --connect-timeout 8 --socks5-hostname 127.0.0.1:$PORT "https://api.ipify.org")
+    [ -n "$IP" ] && echo "[+] SUCCESS! Public Cellular IP: $IP" || echo "[!] FAILED: Verify Mobile Data is active."
+    ;;
+  attach)
+    tmux attach -t "$SESSION"
+    ;;
+esac

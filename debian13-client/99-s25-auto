@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+IFACE="$1"
+ACTION="$2"
+
+if [ "$IFACE" = "wlp2s0" ] && { [ "$ACTION" = "up" ] || [ "$ACTION" = "dhcp4-change" ]; }; then
+  GW=$(ip -4 route show dev wlp2s0 | awk '/default/ {print $3}' | head -n1)
+  if [[ "$GW" =~ ^10\. ]]; then
+    logger -t s25-auto "Detected S25 Hotspot ($GW) on $IFACE. Launching s25-client wifi..."
+    /usr/local/bin/s25-client wifi >/tmp/s25-auto.log 2>&1 &
+  fi
+fi
+
+if [ "$IFACE" = "wlp2s0" ] && [ "$ACTION" = "down" ]; then
+  /usr/local/bin/s25-client stop >/tmp/s25-auto.log 2>&1 &
+fi

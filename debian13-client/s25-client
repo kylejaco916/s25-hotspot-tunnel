@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+TUN="tun0"
+PORT="1080"
+STATE="/run/s25-client.state"
+LOG="/tmp/tun2socks.log"
+S="https:"
+H="http:"
+
+[ "$EUID" -ne 0 ] && exec sudo "$0" "$@"
+
+cleanup() {
+  pkill -x tun2socks 2>/dev/null || true
+  pkill -f "s25-keepalive" 2>/dev/null || true
+  nft delete table inet s25_quic_block 2>/dev/null || true
+  if ip link show "$TUN" >/dev/null 2>&1; then
+    ip route del 0.0.0.0/1 dev "$TUN" 2>/dev/null || true
+    ip route del 128.0.0.0/1 dev "$TUN" 2>/dev/null || true
+    ip link set "$TUN" down 2>/dev/null || true
+    ip tuntap del dev "$TUN" mode tun 2>/dev/null || true
+  fi
+  if [ -f "$STATE" ]; then
+    source "$STATE"
+    [ -n "$GW" ] && [ -n "$DEV" ] && ip route del "$GW/32" dev "$DEV" 2>/dev/null || true
+    rm -f "$STATE"
+  fi
+  sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+  adb forward --remove-all 2>/dev/null || true
+}
+
+up_tun() {
+  local proxy="$1"
+  local iface_flag="$2"
+  systemctl stop zapret.service 2>/dev/null || true
+  sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
+  sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
+  sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null
+  sysctl -w net.ipv4.tcp_keepalive_time=15 >/dev/null
+
+  nft add table inet s25_quic_block 2>/dev/null || true
+  nft add chain inet s25_quic_block output '{ type filter hook output priority 0; }' 2>/dev/null || true
+  nft add rule inet s25_quic_block output udp dport 443 reject 2>/dev/null || true
+
+  ip tuntap add dev "$TUN" mode tun
+  ip addr add 198.18.0.1/15 dev "$TUN"
+  ip link set "$TUN" mtu 1280 up
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+  sysctl -w net.ipv4.conf.$TUN.rp_filter=0 >/dev/null
+
+  ulimit -n 32768 2>/dev/null || true
+  nohup tun2socks -d "$TUN" -p "socks5://${proxy}" $iface_flag --loglevel warn --tcp-auto-tuning > "$LOG" 2>&1 &
+  sleep 1
+
+  if ! pgrep -x tun2socks >/dev/null; then
+    echo "[!] tun2socks failed. Log:" && cat "$LOG"
+    cleanup
+    exit 1
+  fi
+
+  ip route replace 0.0.0.0/1 dev "$TUN" metric 10
+  ip route replace 128.0.0.0/1 dev "$TUN" metric 10
+  systemctl restart dnscrypt-proxy.service 2>/dev/null || true
+
+  nohup bash -c "exec -a s25-keepalive bash -c 'while true; do curl -s4 --max-time 4 --socks5-hostname ${proxy} \"$H//connectivitycheck.gstatic.com/generate_204\" >/dev/null 2>&1; sleep 15; done'" >/dev/null 2>&1 &
+}
+case "${1:-auto}" in
+  usb)
+    cleanup
+    echo "[*] Starting S25 Tunnel [USB ADB MODE]..."
+    adb start-server >/dev/null 2>&1
+    [ "$(adb get-state 2>/dev/null)" != "device" ] && echo "[!] No USB ADB device." && exit 1
+    adb forward tcp:$PORT tcp:$PORT
+    ! curl -s4 --max-time 5 --socks5-hostname 127.0.0.1:$PORT "$S//api.ipify.org" >/dev/null && echo "[!] Check Termux!" && exit 1
+    echo "MODE=USB" > "$STATE"
+    up_tun "127.0.0.1:$PORT" ""
+    "$0" status
+    ;;
+  wifi)
+    cleanup
+    echo "[*] Starting S25 Tunnel [WI-FI HOTSPOT MODE]..."
+    R=$(ip -4 route show default | grep -E "wlan|wlp|wlx" | head -n1)
+    [ -z "$R" ] && R=$(ip -4 route show default | head -n1)
+    GW=$(echo "$R" | awk '{print $3}')
+    DEV=$(echo "$R" | awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}')
+    [ -z "$GW" ] && echo "[!] No Wi-Fi Gateway found." && exit 1
+    echo "[+] Found S25 Gateway: $GW ($DEV)"
+    ! curl -s4 --max-time 5 --socks5-hostname "$GW:$PORT" "$S//api.ipify.org" >/dev/null && echo "[!] Check Termux!" && exit 1
+    sysctl -w net.ipv6.conf.$DEV.disable_ipv6=1 >/dev/null 2>&1 || true
+    ip route replace "$GW/32" dev "$DEV" metric 1
+    printf "MODE=WIFI\nGW=%s\nDEV=%s\n" "$GW" "$DEV" > "$STATE"
+    up_tun "$GW:$PORT" "--interface $DEV"
+    "$0" status
+    ;;
+  auto|start)
+    adb start-server >/dev/null 2>&1
+    [ "$(adb get-state 2>/dev/null)" = "device" ] && "$0" usb || "$0" wifi
+    ;;
+  stop|down)
+    cleanup
+    systemctl start zapret.service 2>/dev/null || true
+    echo "[-] Tunnel stopped."
+    ;;
+  status|test)
+    echo "========================================================"
+    if pgrep -x tun2socks >/dev/null && ip link show "$TUN" >/dev/null 2>&1; then
+      source "$STATE" 2>/dev/null || true
+      echo " [+] STATE   : ACTIVE (${MODE:-TUNNEL} | MTU 1280 | QUIC Blocked)"
+      [ "$MODE" = "WIFI" ] && echo " [+] GATEWAY : $GW:$PORT ($DEV)" || echo " [+] ENDPOINT: 127.0.0.1:$PORT (USB ADB)"
+      DNS=$(dig +short +time=2 +tries=1 google.com @127.0.0.1 | head -n1 || true)
+      echo " [+] DNS TCP : ${DNS:-FAILED}"
+      IP=$(curl -s4 --max-time 5 "$S//api.ipify.org" || echo "TIMEOUT")
+      echo " [+] EGRESS  : $IP (Unthrottled S25 Cellular)"
+    else
+      echo " [-] STATE   : STOPPED (Direct Host Routing)"
+    fi
+    echo "========================================================"
+    ;;
+esac
